@@ -21,4 +21,4 @@ PORT=${PORT:=4442}
 FILE=${FILE:="/tmp/tty_uart"}
 
 echo "Connecting to UART bridge ${HOST}:${PORT} via '${FILE}'..."
-socat TCP:${HOST}:${PORT} PTY,link=${FILE},raw,echo=0
+socat TCP:${HOST}:${PORT} PTY,link=${FILE},raw,echo=0,mode=0666

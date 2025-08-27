@@ -1,13 +1,22 @@
-// TCP server (should work on Linux, Mac, ESP32).
+/*
+ * SPDX-FileCopyrightText: Brian Kuschak <bkuschak@gmail.com>
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * TCP server for the CMSIS-DAP TCP protocol as used by OpenOCD.
+ */
 
-#include <arpa/inet.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
 #include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+
 #include "DAP.h"
 #include "cmsis_dap_tcp.h"
 
@@ -24,312 +33,409 @@
 #define h_u32_to_le(a)  __bswap_32(a)
 #endif
 
-// Only a single client at a time may be connected.
-static int client_sockfd;
-static int server_sockfd;
-static uint8_t request[CMSIS_DAP_PACKET_SIZE];
-static uint8_t response[CMSIS_DAP_PACKET_SIZE];
-static uint8_t packet_buf[CMSIS_DAP_PACKET_SIZE + sizeof(struct cmsis_dap_tcp_packet_hdr)];
+// DAP_PKT_SIZE must be >= to what is used by the client (OpenOCD).
+#define DAP_PKT_SIZE            CONFIG_ESP_DAP_TCP_MAX_PKT_SIZE
+#define DAP_PKT_HDR_SIGNATURE   0x00504144   // "DAP\0" in LE
+#define DAP_PKT_TYPE_REQUEST    0x01
+#define DAP_PKT_TYPE_RESPONSE   0x02
 
-static int socket_available(void)
+// GCC-safe MAX macro
+#define MAX(a, b)               \
+    ({ __typeof__(a) _a = (a);  \
+       __typeof__(b) _b = (b);  \
+       _a > _b ? _a : _b; })
+
+// CMSIS-DAP requests are variable length. With CMSIS-DAP over USB, the
+// transfer sizes are preserved by the USB stack. However, TCP/IP is stream
+// oriented so we perform our own packetization to preserve the boundaries
+// between each request. This short header is prepended to each CMSIS-DAP
+// request and response before being sent over the socket. Little endian format
+// is used for multibyte values.
+struct cmsis_dap_tcp_packet_hdr {
+    uint32_t signature;         // "DAP"
+    uint16_t length;            // Not including header length.
+    uint8_t packet_type;
+    uint8_t reserved;           // Reserved for future use.
+} __attribute__((__packed__));
+
+#define DAP_TOTAL_PKT_SIZE sizeof(struct cmsis_dap_tcp_packet_hdr)+DAP_PKT_SIZE
+
+struct msgbuf_t {
+    uint8_t  data[3*DAP_TOTAL_PKT_SIZE];
+    size_t   len;
+};
+
+struct msgbuf_t buf;
+static uint8_t response[DAP_PKT_SIZE];
+static uint8_t packet_buf[DAP_TOTAL_PKT_SIZE];
+
+// ---------------------------------------------------------------------------
+// Use our own receive buffer to accumulate from the socket until a complete
+// message packet is available.
+
+static void msgbuf_init(struct msgbuf_t *buf)
 {
-    if(client_sockfd == 0)
-        return 0;
-
-    int nbytes;
-    int ret = ioctl(client_sockfd, FIONREAD, &nbytes);
-    if(ret < 0)
-        return 0;
-    return nbytes;
+    buf->len = 0;
 }
 
-// Returns 1 if disconnected, or 0 if still connected, or <0 on error.
-// https://stackoverflow.com/questions/5640144/c-how-to-use-select-to-see-if-a-socket-has-closed/5640173
-static int socket_disconnected(void)
+// Read all data from the socket into our buffer.
+static int msgbuf_add(struct msgbuf_t *buf, int sock)
 {
-    char x;
-    int r;
+    size_t space = sizeof(buf->data) - buf->len;
+    if (space == 0)
+        return -ENOSPC;
 
-    // Non blocking peek to see if any data is available.
-    // If client has disconnected, then recv() will return 0.
-    while(true) {
-        r = recv(client_sockfd, &x, 1, MSG_DONTWAIT|MSG_PEEK);
-        if (r < 0) {
-            switch (errno) {
-                case EINTR:     continue;
-                case EAGAIN:    break; /* empty rx queue */
-                case ETIMEDOUT: break; /* recv timeout */
-                case ENOTCONN:  break; /* not connected yet */
-                default:        return -errno;
+    ssize_t n = recv(sock, buf->data + buf->len, space, 0);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return 0;       // no new data
+        perror("cmsis_dap_tcp: socket read error");
+        return -1;
+    }
+    if (n == 0) {
+        errno = ENOTCONN;   // connection closed
+        return -1;
+    }
+    buf->len += (size_t)n;
+    return 0;
+}
+
+// Read a complete CMSIS-DAP request packet from our buffer.
+// After done using it, call msgbuf_consume(buf, total_len).
+static int msgbuf_parse(struct msgbuf_t *buf,
+        struct cmsis_dap_tcp_packet_hdr *hdr, const uint8_t **payload,
+        size_t *payload_len, size_t *total_len)
+{
+    if (buf->len < sizeof(struct cmsis_dap_tcp_packet_hdr))
+        return -EAGAIN;
+
+    struct cmsis_dap_tcp_packet_hdr tmp;
+    memcpy(&tmp, buf->data, sizeof(tmp));
+    tmp.signature = le_to_h_u32(tmp.signature);
+    tmp.length = le_to_h_u16(tmp.length);
+
+    if (tmp.signature != DAP_PKT_HDR_SIGNATURE) {
+        fprintf(stderr, "cmsis_dap_tcp: Invalid header signature 0x%08lx\n",
+                tmp.signature);
+        return -EINVAL;
+    }
+
+    if (tmp.packet_type != DAP_PKT_TYPE_REQUEST) {
+        fprintf(stderr, "cmsis_dap_tcp: Unrecognized packet type 0x%02hx\n",
+                tmp.packet_type);
+        return -EINVAL;
+    }
+
+    if (buf->len < sizeof(*hdr) + tmp.length)
+        return -EAGAIN;
+
+    // A complete packet is available.
+    *hdr = tmp;
+    *payload = buf->data + sizeof(*hdr);
+    if(payload_len) *payload_len = tmp.length;
+    if(total_len) *total_len = tmp.length + sizeof(*hdr);
+    LOG_DEBUG("Got CMSIS-DAP packet. Len %d", hdr->length);
+
+    return 0;
+}
+
+// Discard data from the buffer.
+static void msgbuf_consume(struct msgbuf_t *buf, size_t n)
+{
+    if(n > buf->len) n = buf->len;
+    memmove(buf->data, buf->data + n, buf->len - n);
+    buf->len -= n;
+
+}
+
+// ---------------------------------------------------------------------------
+
+static int send_dap_response(int sock, const uint8_t *payload, uint16_t len)
+{
+    if (len > DAP_PKT_SIZE) {
+        errno = EMSGSIZE;
+        perror("cmsis_dap_tcp: response too large for buffer");
+        return -1;
+    }
+
+    struct cmsis_dap_tcp_packet_hdr hdr;
+    hdr.signature = h_u32_to_le(DAP_PKT_HDR_SIGNATURE);
+    hdr.length = h_u16_to_le(len);
+    hdr.packet_type = DAP_PKT_TYPE_RESPONSE;
+    hdr.reserved = 0;
+
+    memcpy(packet_buf, &hdr, sizeof(hdr));
+    memcpy(packet_buf + sizeof(hdr), payload, len);
+
+    size_t total_len = sizeof(hdr) + len;
+    size_t sent = 0;
+
+    while (sent < total_len) {
+        ssize_t n = write(sock, packet_buf + sent, total_len - sent);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;   // retry
+            }
+            else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                perror("cmsis_dap_tcp: socket write would block, dropping "
+                        "client");
+                return -1;
+            }
+            else {
+                perror("cmsis_dap_tcp: socket write error");
+                return -1;
             }
         }
-        break;
-    }
-    return r == 0;
-}
-
-// Start the server.
-static int start_server(int port)
-{
-    int ret;
-    struct sockaddr_in server_addr;
-
-    server_sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if(server_sockfd < 0) {
-        fprintf(stderr, "cmsis_dap_tcp: failed to open server socket.\n");
-        return -1;
+        sent += (size_t)n;
     }
 
-    int optval = 1;
-    setsockopt(server_sockfd, SOL_SOCKET, SO_REUSEPORT, &optval,
-            sizeof(optval));
-
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    server_addr.sin_port = htons(port);
-
-    ret = bind(server_sockfd, (void*)&server_addr, sizeof(server_addr));
-    if(ret != 0) {
-        fprintf(stderr, "cmsis_dap_tcp: failed to bind server socket.\n");
-        return -1;
-    }
-
-    ret = fcntl(server_sockfd, F_SETFL, O_NONBLOCK);
-    if(ret < 0) {
-        fprintf(stderr, "cmsis_dap_tcp: failed to set nonblocking server socket.\n");
-        return -1;
-    }
-
-    ret = listen(server_sockfd, 1);
-    if(ret < 0) {
-        fprintf(stderr, "cmsis_dap_tcp: failed to listen to server socket.\n");
-        return -1;
-    }
-
-    fprintf(stderr, "cmsis_dap_tcp: listening on port %d.\n", port);
     return 0;
 }
 
-// Handle incoming connections on server socket. Non-blocking.
-static int handle_server(void)
+static int process_dap_request(int sock, const uint8_t *request, uint16_t len)
 {
-    // Handle a new client connecting.
-    struct sockaddr_in client_addr;
-    socklen_t len = sizeof(client_addr);
-    int ret = accept(server_sockfd, (void*)&client_addr, &len);
-    if(ret < 0) {
-        if(errno == EWOULDBLOCK || errno == EAGAIN)
-            return 0; // No clients connecting.
-        else
-            return ret;
-    }
+    // DAP_ProcessCommand returns:
+    //   number of bytes in response (lower 16 bits)
+    //   number of bytes in request (upper 16 bits)
+    int ret = DAP_ProcessCommand(request, response);
+    int request_len __attribute__((unused)) = (ret>>16) & 0xFFFF;
+    int response_len = ret & 0xFFFF;
+    LOG_DEBUG("processed command. Request len: %d, response len: %d.",
+            request_len, response_len);
 
-    // We only support a single connected client. If a client is already
-    // connected, drop new connections.
-    if(client_sockfd != 0) {
-        fprintf(stderr, "cmsis_dap_tcp: dropping new connection.\n");
-        close(ret);
+    return send_dap_response(sock, response, response_len);
+}
+
+static void set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) flags = 0;
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static void set_keepalives(int fd)
+{
+#ifdef CONFIG_ESP_DAP_TCP_KEEPALIVE_TIMEOUT
+    // Use TCP keepalives to detect dead clients.
+    int val = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val));
+
+    // Seconds between probes (Linux and ESP32)
+    val = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &val, sizeof(val));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &val, sizeof(val));
+
+    // Number of probes to send before closing the connection.
+    val = 5;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &val, sizeof(val));
+#endif
+}
+
+void cmsis_dap_tcp_task(void *arg __attribute__((unused)))
+{
+    struct sockaddr_in addr4;
+    struct sockaddr_in6 addr6;
+    int listener4_fd = -1;
+    int listener6_fd = -1;
+    int port = CONFIG_ESP_DAP_TCP_PORT;
+
+#ifdef CONFIG_LWIP_IPV4
+    listener4_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if(listener4_fd < 0) {
+        perror("cmsis_dap_tcp: Failed to create IPv4 socket");
     }
     else {
-        client_sockfd = ret;
-        fprintf(stderr, "cmsis_dap_tcp: client connected %s:%d\n",
-                inet_ntoa(client_addr.sin_addr),
-                ntohs(client_addr.sin_port));
+        int yes = 1;
+        setsockopt(listener4_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-        // Use TCP keepalives to detect dead clients.
-        int val = 1;
-        setsockopt(client_sockfd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val));
-#if defined(__linux__) || defined(ESP_PLATFORM)
-        // Seconds between probes (Linux and ESP32)
-        val = 1;
-        setsockopt(client_sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &val,
-                    sizeof(val));
-        setsockopt(client_sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &val,
-                    sizeof(val));
-        // Number of probes to send before closing the connection.
-        val = 5;
-        setsockopt(client_sockfd, IPPROTO_TCP, TCP_KEEPCNT, &val,
-                    sizeof(val));
-#elif defined(__APPLE__)
-        // Seconds between probes (MacOS). TCP_KEEPALIVE is like TCP_KEEPIDLE.
-        val = 5;
-        setsockopt(client_sockfd, IPPROTO_TCP, TCP_KEEPALIVE, &val,
-                    sizeof(val));
-#else
-#warning "Platform not recognized! Cannot setup TCP keepalive."
-#endif
-        ret = fcntl(client_sockfd, F_SETFL, O_NONBLOCK);
-        if(ret < 0) {
-            fprintf(stderr, "cmsis_dap_tcp: failed to set nonblocking server socket.\n");
-            return -1;
+        memset(&addr4, 0, sizeof(addr4));
+        addr4.sin_family = AF_INET;
+        addr4.sin_addr.s_addr = INADDR_ANY;
+        addr4.sin_port = htons(port);
+
+        if (bind(listener4_fd, (struct sockaddr *)&addr4, sizeof(addr4)) < 0) {
+            perror("cmsis_dap_tcp: failed to bind IPv4 socket");
+            close(listener4_fd);
+            listener4_fd = -1;
+        }
+        else if(listen(listener4_fd, 1) < 0) {
+            perror("cmsis_dap_tcp: failed to listen on IPv4 socket");
+            close(listener4_fd);
+            listener4_fd = -1;
+        }
+        else {
+            set_nonblocking(listener4_fd);
         }
     }
-    return 0;
-}
+#endif
 
-// Just check if the client has disconnected.
-static int handle_client(void)
-{
-    if(client_sockfd == 0)
-        return 0;
-
-    if(socket_disconnected()) {
-        fprintf(stderr, "cmsis_dap_tcp: client disconnected.\n");
-        close(client_sockfd);
-        client_sockfd = 0;
+#ifdef CONFIG_LWIP_IPV6
+    // TODO - IPV6 untested.
+    listener6_fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if(listener6_fd < 0) {
+        perror("cmsis_dap_tcp: Failed to create IPv6 socket");
     }
-    return 0;
-}
+    else {
+        int yes = 1;
+        setsockopt(listener6_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-// Read from socket. Return number of bytes, or <0 on error.
-static int socket_read(void* data, int len)
-{
-    if(client_sockfd == 0)
-        return -1;      // No client.
+        memset(&addr6, 0, sizeof(addr6));
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_addr = in6addr_any;
+        addr6.sin6_port = htons(port);
 
-    return read(client_sockfd, data, len);
-}
+        if (bind(listener6_fd, (struct sockaddr *)&addr6, sizeof(addr6)) < 0) {
+            perror("cmsis_dap_tcp: failed to bind IPv6 socket");
+            close(listener6_fd);
+            listener6_fd = -1;
+        }
+        else if(listen(listener6_fd, 1) < 0) {
+            perror("cmsis_dap_tcp: failed to listen on IPv6 socket");
+            close(listener6_fd);
+            listener6_fd = -1;
+        }
+        else {
+            set_nonblocking(listener6_fd);
+        }
+    }
+#endif
 
-// Peek at the socket data, but don't remove the bytes from the socket buffer.
-static int socket_peek(void* data, int len)
-{
-    if(client_sockfd == 0)
-        return -1;      // No client.
-
-    return recv(client_sockfd, data, len, MSG_PEEK);
-}
-
-// Read from socket. Return number of bytes, or <0 on error.
-static int socket_write(void* data, int len)
-{
-    if(client_sockfd == 0)
-        return -1;      // No client.
-
-    return write(client_sockfd, data, len);
-}
-
-// ----------------------------------------------------------------------------
-
-static int send_dap_response(uint8_t *buf, int len)
-{
-    struct cmsis_dap_tcp_packet_hdr *header = (void*)packet_buf;
-
-    if(len > sizeof(packet_buf) - sizeof(*header)) {
-        fprintf(stderr, "cmsis_dap_tcp: response too large for buffer!\n");
-        return -1;
+    if (listener4_fd < 0 && listener6_fd < 0) {
+        perror("cmsis_dap_tcp: Failed to create any listening socket.");
+        vTaskDelete(NULL);
+        return;
     }
 
-    header->signature = h_u32_to_le(DAP_PKT_HDR_SIGNATURE);
-    header->length = h_u16_to_le(len);
-    header->packet_type = DAP_PKT_TYPE_RESPONSE;
-    header->reserved = 0;
+    if (listener4_fd >= 0)
+        fprintf(stdout, "cmsis_dap_tcp: listening on IPv4 port %d.\n", port);
+    if (listener6_fd >= 0)
+        fprintf(stdout, "cmsis_dap_tcp: listening on IPv6 port %d.\n", port);
 
-    uint8_t *payload = packet_buf + sizeof(*header);
-    memcpy(payload, buf, len);
+    msgbuf_init(&buf);
 
-    len += sizeof(*header);
-    int ret = socket_write(packet_buf, len);
-    if(ret < 0)
-        return ret;
-    return ret == len ? 0 : -1;
-}
+    // Only one active client at a time is allowed.
+    int client_fd = -1;
+    int run __attribute__((unused)) = 0;
 
-// Read one complete DAP request packet from the socket if possible.
-// Return number of bytes received on success or <0 on error.
-// If a complete packet is not available, return 0.
-static int recv_dap_request(uint8_t *buf, int len)
-{
-    struct cmsis_dap_tcp_packet_hdr header;
+    while (1) {
+        char ipstr[INET6_ADDRSTRLEN];
+        struct sockaddr_storage client_addr;
+        socklen_t addr_len = sizeof(client_addr);
 
-    if(socket_available() < sizeof(header))
-        return 0;
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        if (listener4_fd >= 0) FD_SET(listener4_fd, &read_fds);
+        if (listener6_fd >= 0) FD_SET(listener6_fd, &read_fds);
+        if (client_fd >= 0) FD_SET(client_fd, &read_fds);
+        int fdmax = MAX(client_fd, MAX(listener4_fd, listener6_fd));
 
-    LOG_DEBUG_IO("Peeking at header");
-    int ret = socket_peek(&header, sizeof(header));
-    if(ret < 0)
-        return ret;
-    if(ret < sizeof(header))
-        return -1;      /* Shouldn't happen */
-    if(le_to_h_u32(header.signature) != DAP_PKT_HDR_SIGNATURE) {
-        LOG_ERROR("Incorrect header signature 0x%08lx",
-                le_to_h_u32(header.signature));
-        socket_read(&header, sizeof(header));   // Discard.
-        return -1;
+        int sel = select(fdmax + 1, &read_fds, NULL, NULL, NULL);
+        if (sel < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("cmsis_dap_tcp: select error");
+            break;
+        }
+
+        LOG_DEBUG("run %d", ++run);
+
+        // New connection?
+        if (listener4_fd >= 0 && FD_ISSET(listener4_fd, &read_fds)) {
+            int new_fd = accept(listener4_fd, (struct sockaddr*)&client_addr,
+                    &addr_len);
+            if(new_fd < 0) {
+                if(errno != EAGAIN && errno != EWOULDBLOCK) {
+                    // Just ignore error for now.
+                    perror("cmsis_dap_tcp: accept error");
+                }
+            }
+            else {
+                if (client_fd >= 0) {
+                    fprintf(stderr, "cmsis_dap_tcp: dropping new connection. "
+                            "Another client is already connected.\n");
+                    close(new_fd);
+                }
+                else {
+                    struct sockaddr_in* s = (void*) &client_addr;
+                    inet_ntop(client_addr.ss_family, &s->sin_addr, ipstr,
+                            sizeof(ipstr));
+
+                    fprintf(stdout, "cmsis_dap_tcp: client connected %s:%d\n",
+                            ipstr, ntohs(s->sin_port));
+                    fcntl(new_fd, F_SETFL, O_NONBLOCK);
+                    set_keepalives(new_fd);
+                    client_fd = new_fd;
+                    msgbuf_init(&buf);
+                    continue;   // restart select() loop
+                }
+            }
+        }
+        if (listener6_fd >= 0 && FD_ISSET(listener6_fd, &read_fds)) {
+            socklen_t addr_len = sizeof(client_addr);
+            int new_fd = accept(listener6_fd, (struct sockaddr*)&client_addr,
+                    &addr_len);
+            if (new_fd >= 0) {
+                if (client_fd >= 0) {
+                    fprintf(stderr, "cmsis_dap_tcp: dropping new connection. "
+                            "Another client is already connected.\n");
+                    close(new_fd);
+                }
+                else {
+                    struct sockaddr_in6* s = (void*) &client_addr;
+                    inet_ntop(client_addr.ss_family, &s->sin6_addr, ipstr,
+                            sizeof(ipstr));
+
+                    fprintf(stdout, "cmsis_dap_tcp: client connected "
+                            "[%s]:%d\n", ipstr, ntohs(s->sin6_port));
+                    fcntl(new_fd, F_SETFL, O_NONBLOCK);
+                    set_keepalives(new_fd);
+                    client_fd = new_fd;
+                    msgbuf_init(&buf);
+                    continue;   // restart select() loop
+                }
+            }
+        }
+
+        // Data from client?
+        if (client_fd >= 0 && FD_ISSET(client_fd, &read_fds)) {
+            if (msgbuf_add(&buf, client_fd) < 0) {
+                if(errno != ENOSPC) {
+                    fprintf(stdout, "cmsis_dap_tcp: client disconnected.\n");
+                    close(client_fd);
+                    client_fd = -1;
+                    continue;   // restart select() loop
+                }
+            }
+
+            // Process all the DAP requests in our buffer.
+            struct cmsis_dap_tcp_packet_hdr hdr;
+            const uint8_t *payload;
+            while (true) {
+                size_t payload_len;
+                size_t total_len;
+                int ret = msgbuf_parse(&buf, &hdr, &payload, &payload_len,
+                        &total_len);
+                if(ret < 0)
+                    break;
+
+                ret = process_dap_request(client_fd, payload, payload_len);
+                msgbuf_consume(&buf, total_len);
+
+                // If we cannot process the request and response, just close
+                // the connection.
+                if(ret < 0) {
+                    fprintf(stdout, "cmsis_dap_tcp: disconnecting.\n");
+                    close(client_fd);
+                    client_fd = -1;
+                    break;
+                }
+            }
+        }
     }
-    if(header.packet_type != DAP_PKT_TYPE_REQUEST) {
-        LOG_ERROR("Unrecognized packet type 0x%02hx", header.packet_type);
-        socket_read(&header, sizeof(header));   // Discard.
-        return -1;
-    }
-    if(socket_available() < sizeof(header) + le_to_h_u16(header.length))
-        return 0;
 
-    // A complete packet is available. Strip the header and return the data.
-    if(len < le_to_h_u16(header.length)) {
-        LOG_ERROR("Buffer too small for packet. %d < %d.", len,
-                header.length);
-        return -1;
-    }
-    ret = socket_read(&header, sizeof(header));
-    if(ret < 0)
-        return ret;
-    if(ret < sizeof(header))
-        return -1;      /* Shouldn't happen */
-    ret = socket_read(buf, le_to_h_u16(header.length));
-    if(ret < 0)
-        return ret;
-    if(ret < header.length)
-        return -1;      /* Shouldn't happen */
-    LOG_DEBUG_IO("Got CMSIS-DAP packet. Len %d", header.length);
-    return ret;
-}
-
-// Read any incoming commands, execute them, and send responses.
-// Return zero on success or nothing to do, and <0 on error.
-int process_dap_requests(void)
-{
-    int ret_cmd;
-
-    // Receive from socket, process all commands or until an error occurs.
-    while(true) {
-        int ret = recv_dap_request(request, sizeof(request));
-        if(ret <= 0)
-            return ret;
-
-        // DAP_ProcessCommand returns:
-        //   number of bytes in response (lower 16 bits)
-        //   number of bytes in request (upper 16 bits)
-        ret = DAP_ProcessCommand(request, response);
-        int request_len = (ret>>16) & 0xFFFF;
-        int response_len = ret & 0xFFFF;
-        LOG_DEBUG_IO("Processed command. Request len: %d, response len: %d.",
-                request_len, response_len);
-
-        ret = send_dap_response(response, response_len);
-        if(ret < 0)
-            return ret;
-    }
-}
-
-// ----------------------------------------------------------------------------
-
-int cmsis_dap_tcp_init(int port_number)
-{
-    int ret = start_server(port_number);
-    if(ret < 0) {
-        LOG_ERROR("Failed starting server on port %d.", port_number);
-    }
-    return ret;
-}
-
-int cmsis_dap_tcp_process(void)
-{
-  handle_server();
-  handle_client();
-
-  if(client_sockfd != 0)
-      return process_dap_requests();
-  else
-      return 0;
+    fprintf(stdout, "cmsis_dap_tcp: shutting down.\n");
+    if (listener4_fd >= 0) close(listener4_fd);
+    if (listener6_fd >= 0) close(listener6_fd);
+    if (client_fd >= 0) close(client_fd);
+    vTaskDelete(NULL);
 }

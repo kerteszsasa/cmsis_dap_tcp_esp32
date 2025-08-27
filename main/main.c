@@ -53,6 +53,7 @@
 #include "esp_event.h"
 #include "esp_flash.h"
 #include "esp_mac.h"
+#include "esp_netif_ip_addr.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "lwip/err.h"
@@ -168,6 +169,14 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         wifi_retry_num = 0;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
+#ifdef CONFIG_LWIP_IPV6
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_GOT_IP6) {
+        ip_event_got_ip6_t* event = (ip_event_got_ip6_t*) event_data;
+        printf("IPv6 address: " IPV6STR "\n", IPV62STR(event->ip6_info.ip));
+        wifi_retry_num = 0;
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+#endif
 }
 
 int wifi_init(void)
@@ -196,7 +205,14 @@ int wifi_init(void)
                 &event_handler,
                 NULL,
                 &instance_got_ip));
-
+#ifdef CONFIG_LWIP_IPV6
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+                IP_EVENT,
+                IP_EVENT_GOT_IP6,
+                &event_handler,
+                NULL,
+                &instance_got_ip));
+#endif
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = WIFI_SSID,
@@ -229,9 +245,11 @@ int wifi_init(void)
             portMAX_DELAY);
 
     if (bits & WIFI_CONNECTED_BIT) {
+#ifdef CONFIG_ESP_DAP_DISABLE_WIFI_POWER_SAVE
         // Disable power-save to improve WiFi performance.
         // https://github.com/espressif/arduino-esp32/issues/1484
-        esp_wifi_set_ps (WIFI_PS_NONE);
+        esp_wifi_set_ps(WIFI_PS_NONE);
+#endif
         return 0;   // Success.
     }
 
@@ -306,13 +324,6 @@ void app_main(void)
     xTaskCreate(uart_bridge_task, "uart_bridge_task", 4096, NULL, 5, NULL);
 #endif
 
-    // Initialize the CMSIS-DAP tcp server.
-    cmsis_dap_tcp_init(CMSIS_DAP_TCP_PORT);
+    xTaskCreate(cmsis_dap_tcp_task, "cmsis_dap_tcp_task", 4096, NULL, 5, NULL);
     cmsis_dap_tcp_initialized = true;
-
-    while(1) {
-        // Handle the CMSIS-DAP commands.
-        cmsis_dap_tcp_process();
-        vTaskDelay(1);
-    }
 }

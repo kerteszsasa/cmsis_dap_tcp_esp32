@@ -251,11 +251,38 @@ menu "CMSIS-DAP configuration"
 
     endmenu
 
+    config ESP_DAP_TCP_PORT
+        int "CMSIS-DAP TCP port number"
+        default 4441
+        help
+            Select the TCP port number for CMSIS-DAP.
+
+    config ESP_DAP_TCP_MAX_PKT_SIZE
+        int "CMSIS-DAP maximum packet size"
+        default 1024
+        help
+            Choose the maximum size of a CMSIS-DAP request or response.
+            Should be >= to that used by the client.
+
+    config ESP_DAP_TCP_USE_KEEPALIVE
+        bool "Enable TCP keep-alive packets and disconnect on timeout"
+        default y
+        help
+            To detect dead clients, use TCP keepalives and drop the connection
+            if a timeout occurs.
+
+    config ESP_DAP_DISABLE_WIFI_POWER_SAVE
+        bool "Disable WiFi power saving mode for higher performance."
+        default y
+        help
+            Uses more power but improves throughput.
+
     config ESP_DAP_IO_PORT_WRITE_CYCLES
         int "Number of CPU clock cycles for a GPIO port write"
         default 72
         help
-            This number may need to be tuned to get an accurate SWCLK/TCK frequency.
+            This number may need to be tuned to get an accurate SWCLK/TCK
+            frequency.
 
     config ESP_DAP_DELAY_SLOW_CYCLES
         int "Number of CPU clock cycles for one delay loop iteration"
