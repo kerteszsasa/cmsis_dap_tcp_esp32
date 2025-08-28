@@ -19,13 +19,6 @@ extern "C" {
 #define LOG_DEBUG(...) { }
 #endif
 
-#define LOG_ERROR(...) \
-{ \
-    fprintf(stderr, "cmsis_dap_tcp ERROR: "); \
-    fprintf(stderr, ##__VA_ARGS__); \
-    fprintf(stderr, "\n"); \
-}
-
 // Task that runs the TCP server and processes requests and responses.
 void cmsis_dap_tcp_task(void* arg);
 

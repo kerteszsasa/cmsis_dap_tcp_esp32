@@ -57,8 +57,12 @@
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "lwip/err.h"
+#include "lwip/dhcp6.h"
+#include "lwip/prot/dhcp6.h"
 #include "lwip/sys.h"
 #include "nvs_flash.h"
+
+#include "esp_netif_net_stack.h"
 
 #include "DAP.h"
 #include "cmsis_dap_tcp.h"
@@ -118,6 +122,7 @@ static char mac_addr_str[16];
 static int wifi_retry_num;
 static EventGroupHandle_t wifi_event_group;
 static bool cmsis_dap_tcp_initialized;
+static esp_netif_t *sta_netif;
 
 static void reboot(void)
 {
@@ -140,6 +145,14 @@ static void event_handler(void* arg, esp_event_base_t event_base,
             esp_wifi_sta_get_rssi(&rssi);
             printf("Connected to WiFi SSID: '%s'. RSSI: %d dBm\n", WIFI_SSID,
                     rssi);
+#ifdef CONFIG_LWIP_IPV6
+            // Trigger IPv6 SLAAC auto-configuration.
+            esp_err_t err = esp_netif_create_ip6_linklocal(sta_netif);
+            if (err != ESP_OK) {
+                // Handle error
+                perror("Failed to create IPv6 link local address");
+            }
+#endif
         }
         else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
             if (cmsis_dap_tcp_initialized) {
@@ -172,9 +185,30 @@ static void event_handler(void* arg, esp_event_base_t event_base,
 #ifdef CONFIG_LWIP_IPV6
     else if (event_base == IP_EVENT && event_id == IP_EVENT_GOT_IP6) {
         ip_event_got_ip6_t* event = (ip_event_got_ip6_t*) event_data;
-        printf("IPv6 address: " IPV6STR "\n", IPV62STR(event->ip6_info.ip));
+        esp_ip6_addr_type_t ipv6_type =
+            esp_netif_ip6_get_addr_type(&event->ip6_info.ip);
+        printf("IPv6 address (%s): " IPV6STR "\n",
+                (ipv6_type == ESP_IP6_ADDR_IS_LINK_LOCAL) ? "link-local" :
+                "global", IPV62STR(event->ip6_info.ip));
         wifi_retry_num = 0;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+
+#ifdef CONFIG_LWIP_IPV6_DHCP6
+        if(ipv6_type == ESP_IP6_ADDR_IS_LINK_LOCAL) {
+            // Trigger DHCPv6 client stateless configuration.
+            //printf("Triggering DHCPv6 stateless configuration\n");
+            struct netif *lwip_netif =
+                esp_netif_get_netif_impl(sta_netif);
+            netif_set_flags(lwip_netif, NETIF_FLAG_MLD6);
+            netif_set_ip6_autoconfig_enabled(lwip_netif, 1);
+            esp_err_t err = dhcp6_enable_stateless(lwip_netif);
+            if (err != ESP_OK) {
+                // Handle error
+                perror("Failed to enable IPv6 DHCP stateless "
+                       "autoconfiguration");
+            }
+        }
+#endif
     }
 #endif
 }
@@ -186,7 +220,7 @@ int wifi_init(void)
     ESP_ERROR_CHECK(esp_netif_init());
 
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    sta_netif = esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -250,6 +284,7 @@ int wifi_init(void)
         // https://github.com/espressif/arduino-esp32/issues/1484
         esp_wifi_set_ps(WIFI_PS_NONE);
 #endif
+
         return 0;   // Success.
     }
 
