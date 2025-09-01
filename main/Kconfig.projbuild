@@ -288,6 +288,14 @@ menu "CMSIS-DAP configuration"
         int "Number of CPU clock cycles for one delay loop iteration"
         default 5
         help
-            This number may need to be tuned to get an accurate SWCLK/TCK frequency.
+            This number may need to be tuned to get an accurate SWCLK/TCK
+            frequency.
+
+    config ESP_PRINT_CPU_USAGE
+        bool "Print CPU usage for each task"
+        default n
+        help
+            For debugging, periodically print CPU usage of each task to the
+            console.
 
 endmenu

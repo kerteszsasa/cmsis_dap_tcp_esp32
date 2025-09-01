@@ -46,6 +46,8 @@
 #include <string.h>
 #include <inttypes.h>
 #include "sdkconfig.h"
+
+#include "cpu_usage.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -265,7 +267,6 @@ int wifi_init(void)
     };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
-
     ESP_ERROR_CHECK(esp_wifi_start());
 
     /* Wait until either the connection is established (WIFI_CONNECTED_BIT)
@@ -361,4 +362,9 @@ void app_main(void)
 
     xTaskCreate(cmsis_dap_tcp_task, "cmsis_dap_tcp_task", 4096, NULL, 5, NULL);
     cmsis_dap_tcp_initialized = true;
+
+#ifdef CONFIG_ESP_PRINT_CPU_USAGE
+    xTaskCreatePinnedToCore(cpu_usage_task, "cpu_usage", 4096, NULL,
+            CPU_USAGE_TASK_PRIO, NULL, tskNO_AFFINITY);
+#endif
 }
