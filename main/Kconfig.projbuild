@@ -271,6 +271,14 @@ menu "CMSIS-DAP configuration"
             To detect dead clients, use TCP keepalives and drop the connection
             if a timeout occurs.
 
+    config ESP_DAP_TCP_KEEPALIVE_TIMEOUT
+        int "TCP keep-alive timeout in seconds"
+        default 10
+        depends on ESP_DAP_TCP_USE_KEEPALIVE
+        help
+            Drop the connection if a client does not respond for this
+            number of seconds.
+
     config ESP_DAP_DISABLE_WIFI_POWER_SAVE
         bool "Disable WiFi power saving mode for higher performance."
         default y
@@ -294,6 +302,9 @@ menu "CMSIS-DAP configuration"
     config ESP_PRINT_CPU_USAGE
         bool "Print CPU usage for each task"
         default n
+        select FREERTOS_USE_TRACE_FACILITY
+        select FREERTOS_GENERATE_RUN_TIME_STATS
+        select FREERTOS_RUN_TIME_COUNTER_TYPE_U64
         help
             For debugging, periodically print CPU usage of each task to the
             console.

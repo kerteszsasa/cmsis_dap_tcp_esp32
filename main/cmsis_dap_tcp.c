@@ -39,11 +39,12 @@
 #define DAP_PKT_TYPE_REQUEST    0x01
 #define DAP_PKT_TYPE_RESPONSE   0x02
 
-// GCC-safe MAX macro
+#ifndef MAX
 #define MAX(a, b)               \
     ({ __typeof__(a) _a = (a);  \
        __typeof__(b) _b = (b);  \
        _a > _b ? _a : _b; })
+#endif
 
 // CMSIS-DAP requests are variable length. With CMSIS-DAP over USB, the
 // transfer sizes are preserved by the USB stack. However, TCP/IP is stream
@@ -215,7 +216,7 @@ static void set_nonblocking(int fd)
 
 static void set_keepalives(int fd)
 {
-#ifdef CONFIG_ESP_DAP_TCP_KEEPALIVE_TIMEOUT
+#ifdef CONFIG_ESP_DAP_TCP_USE_KEEPALIVE
     // Use TCP keepalives to detect dead clients.
     int val = 1;
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val));
@@ -226,90 +227,77 @@ static void set_keepalives(int fd)
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &val, sizeof(val));
 
     // Number of probes to send before closing the connection.
-    val = 5;
+    val = CONFIG_ESP_DAP_TCP_KEEPALIVE_TIMEOUT;
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &val, sizeof(val));
+
+    LOG_DEBUG("cmsis_dap_tcp: Using TCP keepalives with %d second "
+            "timeout.", CONFIG_ESP_UART_BRIDGE_KEEPALIVE_TIMEOUT);
 #endif
 }
 
 void cmsis_dap_tcp_task(void *arg __attribute__((unused)))
 {
-    struct sockaddr_in addr4;
-    struct sockaddr_in6 addr6;
-    int listener4_fd = -1;
-    int listener6_fd = -1;
+    int listener_fd;
     int port = CONFIG_ESP_DAP_TCP_PORT;
 
-#ifdef CONFIG_LWIP_IPV4
-    listener4_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if(listener4_fd < 0) {
-        perror("cmsis_dap_tcp: Failed to create IPv4 socket");
-    }
-    else {
-        int yes = 1;
-        setsockopt(listener4_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-        memset(&addr4, 0, sizeof(addr4));
-        addr4.sin_family = AF_INET;
-        addr4.sin_addr.s_addr = INADDR_ANY;
-        addr4.sin_port = htons(port);
-
-        if (bind(listener4_fd, (struct sockaddr *)&addr4, sizeof(addr4)) < 0) {
-            perror("cmsis_dap_tcp: failed to bind IPv4 socket");
-            close(listener4_fd);
-            listener4_fd = -1;
-        }
-        else if(listen(listener4_fd, 1) < 0) {
-            perror("cmsis_dap_tcp: failed to listen on IPv4 socket");
-            close(listener4_fd);
-            listener4_fd = -1;
-        }
-        else {
-            set_nonblocking(listener4_fd);
-        }
-    }
-#endif
-
 #ifdef CONFIG_LWIP_IPV6
-    // TODO - IPV6 untested.
-    listener6_fd = socket(AF_INET6, SOCK_STREAM, 0);
-    if(listener6_fd < 0) {
-        perror("cmsis_dap_tcp: Failed to create IPv6 socket");
-    }
-    else {
-        int yes = 1;
-        setsockopt(listener6_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    // Dual stack to allow both IPv4 and IPv6 listeners.
+    char ipstr[INET6_ADDRSTRLEN];
+    struct sockaddr_in6 addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin6_family = AF_INET6;
+    addr.sin6_addr = in6addr_any;
+    addr.sin6_port = htons(port);
 
-        memset(&addr6, 0, sizeof(addr6));
-        addr6.sin6_family = AF_INET6;
-        addr6.sin6_addr = in6addr_any;
-        addr6.sin6_port = htons(port);
-
-        if (bind(listener6_fd, (struct sockaddr *)&addr6, sizeof(addr6)) < 0) {
-            perror("cmsis_dap_tcp: failed to bind IPv6 socket");
-            close(listener6_fd);
-            listener6_fd = -1;
-        }
-        else if(listen(listener6_fd, 1) < 0) {
-            perror("cmsis_dap_tcp: failed to listen on IPv6 socket");
-            close(listener6_fd);
-            listener6_fd = -1;
-        }
-        else {
-            set_nonblocking(listener6_fd);
-        }
-    }
-#endif
-
-    if (listener4_fd < 0 && listener6_fd < 0) {
-        perror("cmsis_dap_tcp: Failed to create any listening socket.");
+    listener_fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if(listener_fd < 0) {
+        perror("cmsis_dap_tcp: Failed to create listening socket.");
         vTaskDelete(NULL);
         return;
     }
 
-    if (listener4_fd >= 0)
-        fprintf(stdout, "cmsis_dap_tcp: listening on IPv4 port %d.\n", port);
-    if (listener6_fd >= 0)
-        fprintf(stdout, "cmsis_dap_tcp: listening on IPv6 port %d.\n", port);
+    int no = 0;
+    if (setsockopt(listener_fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no)) <
+            0) {
+        perror("cmsis_dap_tcp: failed to disable IPV6_V6ONLY for socket");
+    }
+    LOG_DEBUG("Listening on IPv4/IPv6 socket.");
+#else
+    char ipstr[INET_ADDRSTRLEN];
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    listener_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if(listener_fd < 0) {
+        perror("cmsis_dap_tcp: Failed to create listening socket.");
+        vTaskDelete(NULL);
+        return;
+    }
+    LOG_DEBUG("Listening on IPV4 socket.");
+#endif
+
+    int yes = 1;
+    setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    if (bind(listener_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("cmsis_dap_tcp: failed to bind socket");
+        close(listener_fd);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if(listen(listener_fd, 1) < 0) {
+        perror("cmsis_dap_tcp: failed to listen on socket");
+        close(listener_fd);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    set_nonblocking(listener_fd);
+    fprintf(stdout, "cmsis_dap_tcp: listening on port %d.\n", port);
 
     msgbuf_init(&buf);
 
@@ -318,16 +306,14 @@ void cmsis_dap_tcp_task(void *arg __attribute__((unused)))
     int run __attribute__((unused)) = 0;
 
     while (1) {
-        char ipstr[INET6_ADDRSTRLEN];
         struct sockaddr_storage client_addr;
         socklen_t addr_len = sizeof(client_addr);
 
         fd_set read_fds;
         FD_ZERO(&read_fds);
-        if (listener4_fd >= 0) FD_SET(listener4_fd, &read_fds);
-        if (listener6_fd >= 0) FD_SET(listener6_fd, &read_fds);
+        FD_SET(listener_fd, &read_fds);
         if (client_fd >= 0) FD_SET(client_fd, &read_fds);
-        int fdmax = MAX(client_fd, MAX(listener4_fd, listener6_fd));
+        int fdmax = MAX(client_fd, listener_fd);
 
         int sel = select(fdmax + 1, &read_fds, NULL, NULL, NULL);
         if (sel < 0) {
@@ -340,8 +326,8 @@ void cmsis_dap_tcp_task(void *arg __attribute__((unused)))
         LOG_DEBUG("run %d", ++run);
 
         // New connection?
-        if (listener4_fd >= 0 && FD_ISSET(listener4_fd, &read_fds)) {
-            int new_fd = accept(listener4_fd, (struct sockaddr*)&client_addr,
+        if (FD_ISSET(listener_fd, &read_fds)) {
+            int new_fd = accept(listener_fd, (struct sockaddr*)&client_addr,
                     &addr_len);
             if(new_fd < 0) {
                 if(errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -354,45 +340,32 @@ void cmsis_dap_tcp_task(void *arg __attribute__((unused)))
                     fprintf(stderr, "cmsis_dap_tcp: dropping new connection. "
                             "Another client is already connected.\n");
                     close(new_fd);
+                    continue;   // restart select() loop
                 }
-                else {
+
+                int client_port = 0;
+                ipstr[0] = '\0';
+                if(client_addr.ss_family == AF_INET) {
+                    // IPv4
                     struct sockaddr_in* s = (void*) &client_addr;
-                    inet_ntop(client_addr.ss_family, &s->sin_addr, ipstr,
-                            sizeof(ipstr));
-
-                    fprintf(stdout, "cmsis_dap_tcp: client connected %s:%d\n",
-                            ipstr, ntohs(s->sin_port));
-                    fcntl(new_fd, F_SETFL, O_NONBLOCK);
-                    set_keepalives(new_fd);
-                    client_fd = new_fd;
-                    msgbuf_init(&buf);
-                    continue;   // restart select() loop
+                    inet_ntop(AF_INET, &s->sin_addr, ipstr, sizeof(ipstr));
+                    client_port = ntohs(s->sin_port);
                 }
-            }
-        }
-        if (listener6_fd >= 0 && FD_ISSET(listener6_fd, &read_fds)) {
-            socklen_t addr_len = sizeof(client_addr);
-            int new_fd = accept(listener6_fd, (struct sockaddr*)&client_addr,
-                    &addr_len);
-            if (new_fd >= 0) {
-                if (client_fd >= 0) {
-                    fprintf(stderr, "cmsis_dap_tcp: dropping new connection. "
-                            "Another client is already connected.\n");
-                    close(new_fd);
-                }
+#ifdef CONFIG_LWIP_IPV6
                 else {
+                    // IPv6
                     struct sockaddr_in6* s = (void*) &client_addr;
-                    inet_ntop(client_addr.ss_family, &s->sin6_addr, ipstr,
-                            sizeof(ipstr));
-
-                    fprintf(stdout, "cmsis_dap_tcp: client connected "
-                            "[%s]:%d\n", ipstr, ntohs(s->sin6_port));
-                    fcntl(new_fd, F_SETFL, O_NONBLOCK);
-                    set_keepalives(new_fd);
-                    client_fd = new_fd;
-                    msgbuf_init(&buf);
-                    continue;   // restart select() loop
+                    inet_ntop(AF_INET6, &s->sin6_addr, ipstr, sizeof(ipstr));
+                    client_port = ntohs(s->sin6_port);
                 }
+#endif
+                fprintf(stdout, "cmsis_dap_tcp: client connected %s:%d\n",
+                        ipstr, client_port);
+                fcntl(new_fd, F_SETFL, O_NONBLOCK);
+                set_keepalives(new_fd);
+                client_fd = new_fd;
+                msgbuf_init(&buf);
+                continue;   // restart select() loop
             }
         }
 
@@ -434,8 +407,7 @@ void cmsis_dap_tcp_task(void *arg __attribute__((unused)))
     }
 
     fprintf(stdout, "cmsis_dap_tcp: shutting down.\n");
-    if (listener4_fd >= 0) close(listener4_fd);
-    if (listener6_fd >= 0) close(listener6_fd);
     if (client_fd >= 0) close(client_fd);
+    close(listener_fd);
     vTaskDelete(NULL);
 }

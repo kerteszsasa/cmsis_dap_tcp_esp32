@@ -147,14 +147,6 @@ static void event_handler(void* arg, esp_event_base_t event_base,
             esp_wifi_sta_get_rssi(&rssi);
             printf("Connected to WiFi SSID: '%s'. RSSI: %d dBm\n", WIFI_SSID,
                     rssi);
-#ifdef CONFIG_LWIP_IPV6
-            // Trigger IPv6 SLAAC auto-configuration.
-            esp_err_t err = esp_netif_create_ip6_linklocal(sta_netif);
-            if (err != ESP_OK) {
-                // Handle error
-                perror("Failed to create IPv6 link local address");
-            }
-#endif
         }
         else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
             if (cmsis_dap_tcp_initialized) {
@@ -192,25 +184,6 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         printf("IPv6 address (%s): " IPV6STR "\n",
                 (ipv6_type == ESP_IP6_ADDR_IS_LINK_LOCAL) ? "link-local" :
                 "global", IPV62STR(event->ip6_info.ip));
-        wifi_retry_num = 0;
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
-
-#ifdef CONFIG_LWIP_IPV6_DHCP6
-        if(ipv6_type == ESP_IP6_ADDR_IS_LINK_LOCAL) {
-            // Trigger DHCPv6 client stateless configuration.
-            //printf("Triggering DHCPv6 stateless configuration\n");
-            struct netif *lwip_netif =
-                esp_netif_get_netif_impl(sta_netif);
-            netif_set_flags(lwip_netif, NETIF_FLAG_MLD6);
-            netif_set_ip6_autoconfig_enabled(lwip_netif, 1);
-            esp_err_t err = dhcp6_enable_stateless(lwip_netif);
-            if (err != ESP_OK) {
-                // Handle error
-                perror("Failed to enable IPv6 DHCP stateless "
-                       "autoconfiguration");
-            }
-        }
-#endif
     }
 #endif
 }
@@ -283,12 +256,17 @@ int wifi_init(void)
 #ifdef CONFIG_ESP_DAP_DISABLE_WIFI_POWER_SAVE
         // Disable power-save to improve WiFi performance.
         // https://github.com/espressif/arduino-esp32/issues/1484
+        printf("Disabling WiFi power savings to improve performance.\n");
         esp_wifi_set_ps(WIFI_PS_NONE);
 #endif
-
+#ifdef CONFIG_LWIP_IPV6
+        // Trigger IPv6 SLAAC auto-configuration, after IPv4 is up.
+        esp_err_t err = esp_netif_create_ip6_linklocal(sta_netif);
+        if (err != ESP_OK)
+            perror("Failed to create IPv6 link local address");
+#endif
         return 0;   // Success.
     }
-
     return -1;      // Failure.
 }
 
