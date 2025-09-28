@@ -15,8 +15,8 @@ board.
 
 ![diagram](img/cmsis_dap_tcp_diagram.svg)
 
-- Tested with the XIAO ESP32C6 development board as the programmer, and
-  STM32F103 Blue Pill and Nucleo STM32F401RE as the targets.
+- Tested with the XIAO ESP32C6 and ESP32-S3-DevKitC-1 development boards as the
+  programmer, and STM32F103 Blue Pill and Nucleo STM32F401RE as the targets.
 - Either JTAG mode or SWD mode can be used to program the target. 2 GPIO are
   needed for SWD, or a minimum of 4 GPIO for JTAG.
 - An optional GPIO pin can be used to drive the NRST# (SRST) signal, but this
@@ -26,11 +26,13 @@ board.
 - A separate GPIO may be used to control an activity LED.
 - UART to TCP/IP bridge can be enabled to provide access to the target board's
   serial console remotely, using an ESP32 UART.
-- Typical performance: flashing a 512 KB firmware image to the STM32F401RE
+- Typical performance:
+  - Reading / writing SRAM: up to 200 KB/sec
+  - Flashing a 512 KB firmware image to the STM32F401RE
   completes in about 13.4 seconds, including erase, program, and verify (with 4
   to 8 seconds of that time used for flash erasure). The Blue Pill takes about
-  6 seconds for a 64KB image. Performance also depends on the quality of your
-  WiFi network.
+  6 seconds for a 64KB image.
+  - Performance depends on the quality of your WiFi network.
 
 ![pinout](img/xiao_esp32c6_pinout.png)
 
@@ -169,7 +171,6 @@ CMSIS-DAP TCP running on ESP32
 ESP-IDF version: v6.0-dev-1489-g4e036983a7
 Hardware version: esp32s3 with 2 CPU core(s), WiFi/BLE, silicon revision v0.2, 2MB external flash
 Minimum free heap size: 337312 bytes
-Minimum free heap size: 372552 bytes
 MAC address: E4B323B60EB4
 Attempting to connect to WiFi SSID: 'SomeWifiRouter'
 Connected to WiFi SSID: 'SomeWifiRouter'. RSSI: -75 dBm
