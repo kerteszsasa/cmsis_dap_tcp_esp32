@@ -102,27 +102,14 @@ In menuconfig, goto to the "CMSIS-DAP configuration" page.
 
 # Building and Running OpenOCD
 
-The cmsis_dap_tcp driver is committed to the OpenOCD Gerrit repo, change number
-8973. Refer to the [source code](https://review.openocd.org/c/openocd/+/8973).
-Until this change is merged into the main branch of OpenOCD, get it like this:
+Get the latest source code from git. Configure and build it as usual:
 
 ```
 git clone git://git.code.sf.net/p/openocd/code openocd
 cd openocd
-git fetch https://review.openocd.org/openocd refs/changes/73/8973/17
-git checkout FETCH_HEAD
-```
-
-You should see:
-
-```
-HEAD is now at 36b58ef69 jtag/drivers/cmsis_dap: add new backend cmsis_dap_tcp
-```
-
-Configure and build OpenOCD as usual, while enabling the cmsis_dap_tcp driver:
-
-```
-./configure --enable-cmsis-dap-tcp
+./bootstrap
+./configure
+make
 ```
 
 An OpenOCD configuration file has been provided for convenience.
@@ -132,7 +119,7 @@ your ESP32's IP address:
 ```
 adapter driver cmsis-dap
 cmsis-dap backend tcp
-cmsis-dap tcp host 192.168.1.4
+cmsis-dap tcp host 192.168.1.107
 cmsis-dap tcp port 4441
 transport select swd
 reset_config none
@@ -180,18 +167,25 @@ can then run OpenOCD. You should see something like this from the ESP32:
 ```
 CMSIS-DAP TCP running on ESP32
 ESP-IDF version: v6.0-dev-1489-g4e036983a7
-Hardware version: esp32c6 with 1 CPU core(s), WiFi/BLE, 802.15.4 (Zigbee/Thread), silicon revision v0.1, 2MB external flash
+Hardware version: esp32s3 with 2 CPU core(s), WiFi/BLE, silicon revision v0.2, 2MB external flash
+Minimum free heap size: 337312 bytes
 Minimum free heap size: 372552 bytes
 MAC address: E4B323B60EB4
 Attempting to connect to WiFi SSID: 'SomeWifiRouter'
 Connected to WiFi SSID: 'SomeWifiRouter'. RSSI: -75 dBm
 IP address: 192.168.1.107
-cmsis_dap_tcp server listening on port 4441.
+Disabling WiFi power savings to improve performance.
+cmsis_dap_tcp: listening on port 4441.
+UART bridge: remapping UART_TX = GPIO_NUM_16, UART_RX = GPIO_NUM_15.
+UART bridge: listening on port 4442 for UART1.
+IPv6 address (link-local): fe80:0000:0000:0000:9aa3:16ff:feec:6640
+IPv6 address (global): 2406:3400:031f:ba10:9aa3:16ff:feec:6640
 ```
 
 Additional debugging messages may be enabled by editing
 ```main/cmsis_dap_tcp.h``` and uncommenting the following line. This will
 impact performance.
+
 ```
 #define DEBUG_PRINTING
 ```
@@ -213,6 +207,7 @@ you might need to increase the ```cmsis-dap tcp min_timeout``` parameter if
 you see error messages related to command mismatch.
 
 Starting the OpenOCD server like this:
+
 ```
 ./src/openocd \
     --search tcl \
