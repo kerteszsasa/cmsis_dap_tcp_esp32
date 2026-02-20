@@ -137,6 +137,12 @@ esp32> wifi "" ""
 esp32> reboot
 ```
 
+To show the actual WiFi status and the IP address, use the ```status``` command:
+
+```
+esp32> status
+```
+
 After the ESP32 has connected to WiFi and obtained an IP address by DHCP, you
 can then run OpenOCD. The ESP32 will print status and error messages to the
 console, including the WiFi connection status and IP address. A message is
