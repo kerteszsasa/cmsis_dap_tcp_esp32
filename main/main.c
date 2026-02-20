@@ -322,13 +322,46 @@ static int reboot_cmd_handler(int argc, char **argv)
     return 0;
 }
 
+void print_wifi_ip_if_connected(void)
+{
+    esp_netif_ip_info_t ip_info;
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+
+    if (netif == NULL) {
+        printf("No WIFI_STA netif (WiFi not initialized?)\n");
+        return;
+    }
+
+    if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK) {
+        printf("Error at getting IP info\n");
+        return;
+    }
+
+    if (ip_info.ip.addr == 0) {
+        printf("WiFi connected, but no IP address yet\n");
+        return;
+    }
+
+    printf("WiFi OK, IP address: " IPSTR "\n", IP2STR(&ip_info.ip));
+}
+
 static int help_cmd_handler(int argc, char **argv)
 {
     printf("Available commands:\n");
     printf("  help - Show this help message.\n");
     printf("  wifi \"<ssid>\" \"<password>\" [auth_mode] - Configure WiFi "
            "credentials.\n");
+    printf("  status - Show WiFi status, and IP address.\n");
     printf("  reboot - Restart the device.\n");
+
+    print_wifi_ip_if_connected();
+    return 0;
+}
+
+static int status_cmd_handler(int argc, char **argv)
+{
+    printf("WIFI status:\n  ");
+    print_wifi_ip_if_connected();
     return 0;
 }
 
@@ -378,6 +411,15 @@ static void commands_init(void)
         .argtable = NULL
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&reboot_cmd));
+
+    const esp_console_cmd_t status_cmd = {
+        .command = "status",
+        .help = "Show WIFI status",
+        .hint = NULL,
+        .func = &status_cmd_handler,
+        .argtable = NULL
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&status_cmd));
 
     wifi_args.ssid = arg_str1(NULL, NULL, "<ssid>", "WiFi network SSID");
     wifi_args.password =
