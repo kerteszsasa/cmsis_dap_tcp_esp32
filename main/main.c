@@ -77,6 +77,7 @@
 #include "DAP.h"
 #include "cmsis_dap_tcp.h"
 #include "uart_bridge.h"
+#include "driver/uart_vfs.h"
 
 #ifdef CONFIG_ESP_WIFI_CONSOLE_COMMANDS
 #define NVS_NAMESPACE           "wifi_config"
@@ -353,8 +354,6 @@ static int help_cmd_handler(int argc, char **argv)
            "credentials.\n");
     printf("  status - Show WiFi status, and IP address.\n");
     printf("  reboot - Restart the device.\n");
-
-    print_wifi_ip_if_connected();
     return 0;
 }
 
@@ -658,6 +657,14 @@ void app_main(void)
         printf("Restarting due to WiFi connection failures.\n");
         reboot();
     }
+
+#ifdef CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    /* When the USB Serial/JTAG Controller is the default console output
+       the IDF is not register the UART to the VFS and it breaks the uart bridge function,
+       so we have to register manually.
+     */
+    uart_vfs_dev_register();
+#endif
 
 #ifdef CONFIG_ESP_UART_BRIDGE_ENABLED
     xTaskCreate(uart_bridge_task, "uart_bridge_task", 4096, NULL, 5, NULL);
