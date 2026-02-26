@@ -369,3 +369,23 @@ downloaded 98304 bytes in 0.489488s (196.123 KiB/s)
 > dump_image /dev/null 0x20000000 0x18000
 dumped 98304 bytes in 0.832846s (115.267 KiB/s)
 ```
+
+## Installing for ESP32-S3-ZERO
+
+You can use the ESP Web Tools for installing the firmware:
+https://kerteszsasa.github.io/cmsis_dap_tcp_esp32/release/flash.html
+
+It uses this pinout:
+- (1) GPIO number for SWCLK / TCK
+- (2) GPIO number for SWDIO / TMS
+- (3) GPIO number for nRESET
+- (4) GPIO number for UART TX
+- (5) GPIO number for UART RX
+
+The wifi credential are not hardcoded, so first time you have to setup via serial port, with the following command:
+
+wifi "ssid" "pass"
+
+
+
+
