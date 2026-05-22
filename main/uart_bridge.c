@@ -40,7 +40,11 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/unistd.h>
+#include "app_console.h"
 #include "uart_bridge.h"
+
+#define fprintf app_console_fprintf
+#define perror app_console_perror
 
 #define BUFFER_SIZE         512
 #define UART_BUFFER_SIZE    512

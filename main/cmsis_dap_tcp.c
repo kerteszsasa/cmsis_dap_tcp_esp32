@@ -18,7 +18,11 @@
 #include <arpa/inet.h>
 
 #include "DAP.h"
+#include "app_console.h"
 #include "cmsis_dap_tcp.h"
+
+#define fprintf app_console_fprintf
+#define perror app_console_perror
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define le_to_h_u16(a)  (a)

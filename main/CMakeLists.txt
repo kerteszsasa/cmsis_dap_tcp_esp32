@@ -5,6 +5,7 @@ set(COMPONENT_SRCS
     "SWO.c"
     "SW_DP.c"
     "UART.c"
+    "app_console.c"
     "cmsis_dap_tcp.c"
     "main.c")
 

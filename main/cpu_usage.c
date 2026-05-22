@@ -20,6 +20,10 @@
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "app_console.h"
+
+#define printf app_console_printf
+#define perror app_console_perror
 
 
 /* Real time CPU usage display taken from:

@@ -54,6 +54,7 @@
 #include "esp_chip_info.h"
 #include "esp_event.h"
 #include "esp_flash.h"
+#include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif_ip_addr.h"
 #include "esp_netif_types.h"
@@ -70,14 +71,19 @@
 #ifdef CONFIG_ESP_WIFI_CONSOLE_COMMANDS
 #include "esp_console.h"
 #include "argtable3/argtable3.h"
+#include "driver/gpio.h"
 #include "driver/uart.h"
 #include "linenoise/linenoise.h"
 #endif
 
+#include "app_console.h"
 #include "DAP.h"
 #include "cmsis_dap_tcp.h"
 #include "uart_bridge.h"
 #include "driver/uart_vfs.h"
+
+#define printf app_console_printf
+#define perror app_console_perror
 
 #ifdef CONFIG_ESP_WIFI_CONSOLE_COMMANDS
 #define NVS_NAMESPACE           "wifi_config"
@@ -86,6 +92,9 @@
 #define NVS_KEY_AUTH_MODE       "auth_mode"
 #define MAX_SSID_LEN            32
 #define MAX_PASSWORD_LEN        64
+#define CONSOLE_BUTTON_GPIO     GPIO_NUM_0
+#define CONSOLE_BUTTON_HOLD_MS  2000
+#define CONSOLE_BUTTON_POLL_MS  50
 #endif
 
 #if CONFIG_ESP_STATION_EXAMPLE_WPA3_SAE_PWE_HUNT_AND_PECK
@@ -148,12 +157,15 @@ static wifi_auth_mode_t wifi_auth_mode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD;
 static char stored_ssid[MAX_SSID_LEN] = {0};
 static char stored_password[MAX_PASSWORD_LEN] = {0};
 static wifi_auth_mode_t stored_auth_mode = WIFI_AUTH_WPA2_PSK;
+static bool commands_started;
 #endif
 
 static void reboot(void)
 {
-    fflush(stdout);
-    fflush(stderr);
+    if (app_console_is_enabled()) {
+        fflush(stdout);
+        fflush(stderr);
+    }
     vTaskDelay(1000);
     esp_restart();      // Does not return.
 }
@@ -364,8 +376,12 @@ static int status_cmd_handler(int argc, char **argv)
     return 0;
 }
 
-static void commands_init(void)
+static esp_err_t commands_init(void)
 {
+    if (commands_started) {
+        return ESP_OK;
+    }
+
     // Initialize console.
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
@@ -376,21 +392,24 @@ static void commands_init(void)
     defined(CONFIG_ESP_CONSOLE_UART_CUSTOM)
     esp_console_dev_uart_config_t hw_config =
         ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config,
-                &repl));
+    esp_err_t err = esp_console_new_repl_uart(&hw_config, &repl_config,
+            &repl);
 #elif defined(CONFIG_ESP_CONSOLE_USB_CDC)
     esp_console_dev_usb_cdc_config_t hw_config =
         ESP_CONSOLE_DEV_CDC_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_console_new_repl_usb_cdc(&hw_config, &repl_config,
-                &repl));
+    esp_err_t err = esp_console_new_repl_usb_cdc(&hw_config, &repl_config,
+            &repl);
 #elif defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
     esp_console_dev_usb_serial_jtag_config_t hw_config =
         ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&hw_config,
-                &repl_config, &repl));
+    esp_err_t err = esp_console_new_repl_usb_serial_jtag(&hw_config,
+            &repl_config, &repl);
 #else
 #error "Unsupported console type!"
 #endif
+    if (err != ESP_OK) {
+        return err;
+    }
 
     // Register commands.
     const esp_console_cmd_t help_cmd = {
@@ -400,7 +419,10 @@ static void commands_init(void)
         .func = &help_cmd_handler,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&help_cmd));
+    err = esp_console_cmd_register(&help_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
 
     const esp_console_cmd_t reboot_cmd = {
         .command = "reboot",
@@ -409,7 +431,10 @@ static void commands_init(void)
         .func = &reboot_cmd_handler,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&reboot_cmd));
+    err = esp_console_cmd_register(&reboot_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
 
     const esp_console_cmd_t status_cmd = {
         .command = "status",
@@ -418,7 +443,10 @@ static void commands_init(void)
         .func = &status_cmd_handler,
         .argtable = NULL
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&status_cmd));
+    err = esp_console_cmd_register(&status_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
 
     wifi_args.ssid = arg_str1(NULL, NULL, "<ssid>", "WiFi network SSID");
     wifi_args.password =
@@ -435,9 +463,55 @@ static void commands_init(void)
         .func = &wifi_cmd_handler,
         .argtable = &wifi_args
     };
-    printf("Enabling console commands.\n");
-    ESP_ERROR_CHECK(esp_console_cmd_register(&wifi_cmd));
-    ESP_ERROR_CHECK(esp_console_start_repl(repl));
+    err = esp_console_cmd_register(&wifi_cmd);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_console_start_repl(repl);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    commands_started = true;
+    app_console_set_enabled(true);
+    printf("\nConfiguration console enabled.\n");
+    return ESP_OK;
+}
+
+static esp_err_t config_button_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << CONSOLE_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    return gpio_config(&io_conf);
+}
+
+static void config_button_task(void *arg __attribute__((unused)))
+{
+    int pressed_ms = 0;
+
+    while (!commands_started) {
+        if (gpio_get_level(CONSOLE_BUTTON_GPIO) == 0) {
+            pressed_ms += CONSOLE_BUTTON_POLL_MS;
+            if (pressed_ms >= CONSOLE_BUTTON_HOLD_MS) {
+                if (commands_init() == ESP_OK) {
+                    break;
+                }
+                pressed_ms = 0;
+            }
+        } else {
+            pressed_ms = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(CONSOLE_BUTTON_POLL_MS));
+    }
+
+    vTaskDelete(NULL);
 }
 #endif
 
@@ -594,6 +668,7 @@ void app_main(void)
 {
     // Initialize the JTAG/SWD port pins.
     DAP_Setup();
+    esp_log_level_set("*", ESP_LOG_NONE);
 
     printf("CMSIS-DAP TCP running on ESP32\n");
     printf("ESP-IDF version: %s\n", IDF_VER);
@@ -647,7 +722,10 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
 #ifdef CONFIG_ESP_WIFI_CONSOLE_COMMANDS
-    commands_init();
+    if (config_button_init() == ESP_OK) {
+        xTaskCreate(config_button_task, "config_button_task", 2048, NULL, 5,
+                NULL);
+    }
 #endif
 
     /* Initialize WiFi and connect to AP. If unable to connect after retries,
@@ -655,6 +733,11 @@ void app_main(void)
      */
     if (wifi_init() != 0) {
         printf("Restarting due to WiFi connection failures.\n");
+        if (app_console_is_enabled()) {
+            while (1) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+        }
         reboot();
     }
 
